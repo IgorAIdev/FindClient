@@ -557,8 +557,9 @@ def is_film(name):
     return ('пленк' in n or 'плівк' in n) and bool(re.search(r'армир|армован|теплич|uv|укрыв|полиэтилен|поліетилен', n)) and \
         not re.search(r'dtf|мульч|самокле|декор|скотч|лента|фольг|шланг|мебел|окн|теплиц[аы]\b|для печати', n)
 
-def shortlist(db, weak_only=False):
-    """Strict: sellers that list BOTH clear PVC/soft glass AND body film. Site and self-description are only shown."""
+def shortlist(db, weak_only=False, both=False):
+    """Sellers with clear PVC/soft glass and/or body film. Weak site and a self-declared maker rank first;
+    both=True keeps only sellers that list both kinds."""
     sellers = {}
     for row in db.execute("""SELECT l.name AS item,l.price AS item_price,l.url AS item_url,c.* FROM listings l
                              JOIN companies c ON c.id=l.company_id"""):
@@ -570,14 +571,16 @@ def shortlist(db, weak_only=False):
             entry['film'].append((name, row['item_price'], row['item_url']))
     result = []
     for entry in sellers.values():
-        if not (entry['clear'] and entry['film']):
+        if not (entry['clear'] or entry['film']) or (both and not (entry['clear'] and entry['film'])):
             continue
         row = entry['row']
         weak = (row['site_kind'] or 'own') in WEAK_SITES + ('prom_platform',)
         if weak_only and not weak:
             continue
-        result.append({**entry, 'weak': weak, 'kind': seller_kind(row['about'])})
-    return sorted(result, key=lambda r: (-min(len(r['clear']), len(r['film'])), -len(r['clear']) - len(r['film'])))
+        kind = seller_kind(row['about'])
+        result.append({**entry, 'weak': weak, 'kind': kind, 'rank': (
+            not weak, kind not in ('производитель?', 'и то и то'), -len(entry['clear']) - len(entry['film']))})
+    return [{k: v for k, v in r.items() if k != 'rank'} for r in sorted(result, key=lambda r: r['rank'])]
 
 def position(urls, host):
     for number, url in enumerate(urls, 1):
@@ -655,7 +658,7 @@ def main():
     au = sub.add_parser('audit'); au.add_argument('--limit', type=int, default=20)
     se = sub.add_parser('seo'); se.add_argument('config'); se.add_argument('--limit', type=int, default=20)
     kw = sub.add_parser('keywords'); kw.add_argument('--top', type=int, default=30)
-    sl = sub.add_parser('shortlist'); sl.add_argument('--weak-only', action='store_true')
+    sl = sub.add_parser('shortlist'); sl.add_argument('--weak-only', action='store_true'); sl.add_argument('--both', action='store_true')
     of = sub.add_parser('offers'); of.add_argument('words', nargs='+'); of.add_argument('--roll', action='store_true')
     for command in ('export', 'report'):
         out = sub.add_parser(command); out.add_argument('file')
@@ -695,11 +698,13 @@ def main():
                 raise ValueError('limit must be 1..100')
             seo(db, json.loads(Path(a.config).read_text(encoding='utf-8')), a.limit)
         elif a.command == 'shortlist':
-            for r in shortlist(db, a.weak_only):
+            for r in shortlist(db, a.weak_only, a.both):
                 c = r['row']
                 phones = [x[0] for x in db.execute("SELECT value FROM contacts WHERE company_id=? AND kind='phone'", (c['id'],))]
                 print('%s | %s | сайт: %s | %s | %s' % (c['name'][:45], (c['city'] or '?').strip(), SITE_LABELS.get(c['site_kind'] or 'own', ''), r['kind'] or 'не ясно', ', '.join(phones)))
                 for label, items in (('прозрачное', r['clear']), ('плёнка', r['film'])):
+                    if not items:
+                        continue
                     name, price, link = items[0]
                     print('    %s (%d): %s | %s грн | %s' % (label, len(items), name[:80], price or '?', link))
         elif a.command == 'offers':
