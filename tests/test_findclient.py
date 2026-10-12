@@ -130,6 +130,11 @@ class FindClientTests(unittest.TestCase):
         self.assertEqual(f.recommend('own', good)[0], 'none')
         self.assertEqual(f.recommend('own', poor)[0], 'redesign')
 
+    def test_new_products_link_is_not_a_blog(self):
+        page = '<a href="/ua/new_products">Новинки</a>'
+        self.assertFalse(f.score_site(page, 'https://e.com/')['blog'])
+        self.assertTrue(f.score_site('<a href="/ua/news">Новини</a>', 'https://e.com/')['blog'])
+
     def test_recommend_levels(self):
         mid = {'score': 60, 'issues': ['a'], 'sitemap_pages': 40, 'blog': True}
         self.assertEqual(f.recommend('own', mid)[0], 'seo')

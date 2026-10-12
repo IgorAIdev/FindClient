@@ -352,7 +352,7 @@ class SiteParser(Page):
             self.anchors.append((self._anchor[0], ' '.join(self._anchor[1])))
             self._anchor = None
 
-BLOG_RE = re.compile(r'blog|news|article|stat[yi]|новин|стат[іт]|блог|корисн|полезн|poleznoe|novosti', re.I)
+BLOG_RE = re.compile(r'blog|news|article|stat[yi]|новин(?!к)|стат[іт]|блог|корисн|полезн|poleznoe|novosti', re.I)  # not "новинки" (new products)
 
 def score_site(raw, url, elapsed=0.0, sitemap_pages=None, year=None):
     """Heuristic 0-100 score from page HTML. Not a replacement for a real audit."""
@@ -398,8 +398,8 @@ def recommend(kind, result=None):
         return 'site', 'Нет собственного сайта (' + SITE_LABELS[kind] + '): предложить сайт-визитку/каталог.'
     score, top = result['score'], '; '.join(result['issues'][:3])
     if kind == 'prom_platform':
-        return 'prom_site', ('Сайт на конструкторе prom.ua (%d/100): шаблонный и привязан к подписке. '
-                             'Предложить отдельный сайт или SEO-статьи/блог. Главное: %s.' % (score, top))
+        return 'prom_site', ('Сайт на конструкторе prom.ua (%d/100): базовое SEO в шаблоне есть. '
+                             'Предложить SEO-статьи/блог или отдельный сайт. Главное: %s.' % (score, top))
     if score < 45:
         return 'redesign', 'Сайт слабый (%d/100): предложить переделку/адаптацию. Главное: %s.' % (score, top)
     thin = result['sitemap_pages'] is not None and result['sitemap_pages'] < 15
