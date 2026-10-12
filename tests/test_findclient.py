@@ -244,16 +244,23 @@ class FindClientTests(unittest.TestCase):
     def test_keyword_ideas_from_listings(self):
         other = f.add(self.db, 'https://other.ua', 'Other', 'test', 'manual')
         for ident, name in ((self.ident, 'Тент ПВХ 650 для прицепа'), (other, 'Тент ПВХ на Газель &amp;quot;Plandeka&amp;quot;'), (other, 'Мягкое стекло')):
-            self.db.execute('INSERT INTO listings VALUES(?,?)', (ident, name))
+            self.db.execute('INSERT INTO listings(company_id,name) VALUES(?,?)', (ident, name))
         ideas = dict(f.keyword_ideas(self.db))
         self.assertEqual(ideas['тент пвх'], 2)
         self.assertNotIn('мягкое стекло', ideas)  # one seller only
         self.assertFalse({'quot', 'plandeka', 'amp'} & set(ideas))
 
     def test_prom_profile_stores_listing_names(self):
-        raw = self.prom_page('https://www.example.com/') + '<script type="application/ld+json">{"@type":"Product","name":"Тент ПВХ"}</script>'
-        f.ingest_prom(self.db, raw, 'https://prom.ua/c777-test.html', 'prom', 'prom: cat')
-        self.assertEqual([r[0] for r in self.db.execute('SELECT name FROM listings')], ['Тент ПВХ'])
+        raw = self.prom_page('https://www.example.com/') + '<script type="application/ld+json">{"@type":"Product","name":"Тент ПВХ","url":"https://prom.ua/p1-x.html","offers":{"price":"250"}}</script>'
+        for _ in range(2):
+            f.ingest_prom(self.db, raw, 'https://prom.ua/c777-test.html', 'prom', 'prom: cat')
+        self.assertEqual([tuple(r) for r in self.db.execute('SELECT name,url,price FROM listings')], [('Тент ПВХ', 'https://prom.ua/p1-x.html', '250')])
+
+    def test_find_offers(self):
+        for name, price in (('Пленка ПВХ прозрачная 0,5 мм, рулон 50 м', '9000'), ('Пленка ПВХ прозрачная на метраж', '300'), ('Тент', '1')):
+            self.db.execute('INSERT INTO listings(company_id,name,price) VALUES(?,?,?)', (self.ident, name, price))
+        self.assertEqual(len(f.find_offers(self.db, ['пленка', 'прозрачная'])), 2)
+        self.assertEqual([o['price'] for o in f.find_offers(self.db, ['пленка', 'прозрачная'], roll=True)], ['9000'])
 
     def test_old_audits_table_is_migrated(self):
         path = Path(self.tmp.name) / 'old2.db'

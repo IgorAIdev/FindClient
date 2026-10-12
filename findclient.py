@@ -141,7 +141,7 @@ def connect(path):
       company_id INTEGER REFERENCES companies(id), query TEXT, position INTEGER,
       checked_at TEXT, PRIMARY KEY(company_id,query));
     CREATE TABLE IF NOT EXISTS listings (
-      company_id INTEGER REFERENCES companies(id), name TEXT, UNIQUE(company_id,name));
+      company_id INTEGER REFERENCES companies(id), name TEXT, url TEXT, price TEXT, UNIQUE(company_id,name));
     CREATE TABLE IF NOT EXISTS audits (
       company_id INTEGER PRIMARY KEY REFERENCES companies(id), checked_at TEXT,
       score INTEGER, offer TEXT, summary TEXT, details TEXT, error TEXT);
@@ -150,6 +150,10 @@ def connect(path):
     for column in ('city', 'site_kind', 'prom_url'):
         if column not in have:
             db.execute('ALTER TABLE companies ADD COLUMN ' + column + ' TEXT')
+    have = {row[1] for row in db.execute('PRAGMA table_info(listings)')}
+    for column in ('url', 'price'):
+        if column not in have:
+            db.execute('ALTER TABLE listings ADD COLUMN ' + column + ' TEXT')
     have = {row[1] for row in db.execute('PRAGMA table_info(audits)')}
     for column, kind in (('visibility', 'INTEGER'), ('indexed', 'TEXT')):
         if column not in have:
@@ -282,7 +286,8 @@ def prom_company(raw, url):
         except ValueError:
             continue
         if isinstance(data, dict) and data.get('@type') == 'Product' and data.get('name'):
-            info['products'].append(str(data['name'])[:200])
+            offer = data.get('offers') if isinstance(data.get('offers'), dict) else {}
+            info['products'].append((str(data['name'])[:200], str(data.get('url') or '')[:300], str(offer.get('price') or '')))
     return info
 
 def ingest_prom(db, raw, url, campaign, source):
@@ -301,8 +306,9 @@ def ingest_prom(db, raw, url, campaign, source):
         contacts.append(('email', info['email'].strip().lower()))
     if kind == 'social':
         contacts.append(('messenger', info['site']))
-    for name in info['products']:
-        db.execute('INSERT OR IGNORE INTO listings VALUES(?,?)', (ident, name))
+    for name, link, price in info['products']:
+        db.execute('INSERT INTO listings VALUES(?,?,?,?) ON CONFLICT(company_id,name) DO UPDATE SET url=excluded.url,price=excluded.price',
+                   (ident, name, link, price))
     for k, value in contacts:
         db.execute('''INSERT INTO contacts VALUES(?,?,?,?,?)
           ON CONFLICT(company_id,kind,value,source) DO UPDATE SET checked_at=excluded.checked_at''',
@@ -512,6 +518,19 @@ def keyword_ideas(db, top=30):
                     key=lambda x: (-x[0], -x[1].count(' '), x[1]))
     return [(p, n) for n, p in ranked[:top]]
 
+ROLL_RE = re.compile(r'рулон|опт|бухт|\b\d{2,3}\s?м\b', re.I)
+
+def find_offers(db, words, roll=False):
+    """Seller listings (from prom.ua profiles) whose names contain every word; --roll keeps roll/bulk wording."""
+    words = [w.lower() for w in words]
+    found = []
+    for row in db.execute("""SELECT l.name,l.url,l.price,c.id,c.name AS company,c.city,c.site_kind,c.prom_url FROM listings l
+                             JOIN companies c ON c.id=l.company_id ORDER BY c.id,l.name"""):
+        name = html.unescape(html.unescape(row['name']))
+        if all(w in name.lower() for w in words) and (not roll or ROLL_RE.search(name)):
+            found.append({**dict(row), 'name': name})
+    return found
+
 def position(urls, host):
     for number, url in enumerate(urls, 1):
         found = domain(url)
@@ -588,6 +607,7 @@ def main():
     au = sub.add_parser('audit'); au.add_argument('--limit', type=int, default=20)
     se = sub.add_parser('seo'); se.add_argument('config'); se.add_argument('--limit', type=int, default=20)
     kw = sub.add_parser('keywords'); kw.add_argument('--top', type=int, default=30)
+    of = sub.add_parser('offers'); of.add_argument('words', nargs='+'); of.add_argument('--roll', action='store_true')
     for command in ('export', 'report'):
         out = sub.add_parser(command); out.add_argument('file')
     u = sub.add_parser('update'); u.add_argument('id', type=int); u.add_argument('--status', choices=STATUSES); u.add_argument('--notes'); u.add_argument('--role', choices=('manufacturer','seller','installer','directory','unverified'))
@@ -625,6 +645,9 @@ def main():
             if not 1 <= a.limit <= 100:
                 raise ValueError('limit must be 1..100')
             seo(db, json.loads(Path(a.config).read_text(encoding='utf-8')), a.limit)
+        elif a.command == 'offers':
+            for o in find_offers(db, a.words, a.roll):
+                print('%s | %s | %s | %s грн | %s' % (o['company'][:40], o['city'] or '?', o['name'][:90], o['price'] or '?', o['url'] or o['prom_url']))
         elif a.command == 'keywords':
             for phrase, count in keyword_ideas(db, a.top):
                 print(count, phrase)
