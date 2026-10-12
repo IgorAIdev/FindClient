@@ -147,7 +147,7 @@ def connect(path):
       score INTEGER, offer TEXT, summary TEXT, details TEXT, error TEXT);
     ''')
     have = {row[1] for row in db.execute('PRAGMA table_info(companies)')}
-    for column in ('city', 'site_kind', 'prom_url'):
+    for column in ('city', 'site_kind', 'prom_url', 'about'):
         if column not in have:
             db.execute('ALTER TABLE companies ADD COLUMN ' + column + ' TEXT')
     have = {row[1] for row in db.execute('PRAGMA table_info(listings)')}
@@ -260,7 +260,7 @@ def prom_company_links(raw, limit=30):
 
 def prom_company(raw, url):
     """Public profile data from the page's own schema.org block and embedded state."""
-    info = {'id': PROM_PROFILE.match(urlsplit(url).path).group(1), 'name': '', 'city': '', 'phone': '', 'email': '', 'site': ''}
+    info = {'id': PROM_PROFILE.match(urlsplit(url).path).group(1), 'name': '', 'city': '', 'phone': '', 'email': '', 'site': '', 'about': ''}
     for block in re.findall(r'<script type="application/ld\+json">(.*?)</script>', raw, re.S):
         try:
             data = json.loads(block)
@@ -269,7 +269,8 @@ def prom_company(raw, url):
         if isinstance(data, dict) and data.get('@type') == 'Organization':
             address = data.get('address') if isinstance(data.get('address'), dict) else {}
             info.update(name=str(data.get('name') or ''), city=str(address.get('addressLocality') or ''),
-                        phone=str(data.get('telephone') or ''), email=str(data.get('email') or ''))
+                        phone=str(data.get('telephone') or ''), email=str(data.get('email') or ''),
+                        about=str(data.get('description') or '')[:2000])
             break
     match = re.search(r'"webSiteUrl":"((?:[^"\\]|\\.)*)"', raw)
     if match:
@@ -296,8 +297,10 @@ def ingest_prom(db, raw, url, campaign, source):
     own = kind == 'own'
     ident = add(db, info['site'] if own else url, info['name'], campaign, source,
                 None if own else 'prom.ua/c' + info['id'])
-    db.execute('UPDATE companies SET city=?,site_kind=?,prom_url=? WHERE id=?',
-               (info['city'] or None, kind, url, ident))
+    # an audit may have found a prom-built site behind the custom domain; do not downgrade that to 'own'
+    db.execute('''UPDATE companies SET city=?,prom_url=?,about=?,
+                  site_kind=CASE WHEN ?='own' AND site_kind='prom_platform' THEN site_kind ELSE ? END WHERE id=?''',
+               (info['city'] or None, url, info['about'] or None, kind, kind, ident))
     contacts = []
     digits = re.sub(r'\D', '', info['phone'])
     if 10 <= len(digits) <= 15:
@@ -531,6 +534,46 @@ def find_offers(db, words, roll=False):
             found.append({**dict(row), 'name': name})
     return found
 
+MAKER_RE = re.compile(r'собственн\w*\s+производств|производим|производител|виробник|власн\w*\s+виробництв|виготовля|изготавлива|изготовля', re.I)
+DEALER_RE = re.compile(r'дилер|дистрибьют|дистриб.ютор|представител|официальн\w+\s+постав|оптов\w+\s+постав|склад-магазин', re.I)
+
+def seller_kind(about):
+    """What the seller says about itself: 'производитель?' (claims production), 'дилер' or ''. Never verified."""
+    text = about or ''
+    maker, dealer = bool(MAKER_RE.search(text)), bool(DEALER_RE.search(text))
+    return 'производитель?' if maker and not dealer else 'дилер/склад' if dealer and not maker else 'и то и то' if maker else ''
+
+def is_clear(name):
+    n = name.lower().replace('ё', 'е')
+    return ('стекл' in n and ('мягк' in n or "м'як" in n or 'мяк' in n)) or ('прозр' in n and 'пвх' in n and 'пленк' in n)
+
+def is_film(name):
+    n = name.lower().replace('ё', 'е')
+    return ('пленк' in n or 'плівк' in n) and not re.search(r'самокле|декор|скотч|лента|мебел|стекл|окн', n)
+
+def shortlist(db, weak_only=False):
+    """Sellers that list both clear PVC / soft glass and plain film, weak-site and self-declared makers first."""
+    sellers = {}
+    for row in db.execute("""SELECT l.name,l.price,l.url,c.* FROM listings l JOIN companies c ON c.id=l.company_id"""):
+        name = html.unescape(html.unescape(row['name']))
+        entry = sellers.setdefault(row['id'], {'row': dict(row), 'clear': [], 'film': []})
+        if is_clear(name):
+            entry['clear'].append((name, row['price'], row['url']))
+        if is_film(name) and not is_clear(name):
+            entry['film'].append((name, row['price'], row['url']))
+    result = []
+    for entry in sellers.values():
+        if not (entry['clear'] and entry['film']):
+            continue
+        row = entry['row']
+        weak = (row['site_kind'] or 'own') in WEAK_SITES + ('prom_platform',)
+        if weak_only and not weak:
+            continue
+        kind = seller_kind(row['about'])
+        result.append({**entry, 'weak': weak, 'kind': kind,
+                       'rank': (not weak, kind not in ('производитель?', 'и то и то'), -len(entry['clear']) - len(entry['film']))})
+    return [{k: v for k, v in r.items() if k != 'rank'} for r in sorted(result, key=lambda r: r['rank'])]
+
 def position(urls, host):
     for number, url in enumerate(urls, 1):
         found = domain(url)
@@ -607,6 +650,7 @@ def main():
     au = sub.add_parser('audit'); au.add_argument('--limit', type=int, default=20)
     se = sub.add_parser('seo'); se.add_argument('config'); se.add_argument('--limit', type=int, default=20)
     kw = sub.add_parser('keywords'); kw.add_argument('--top', type=int, default=30)
+    sl = sub.add_parser('shortlist'); sl.add_argument('--weak-only', action='store_true')
     of = sub.add_parser('offers'); of.add_argument('words', nargs='+'); of.add_argument('--roll', action='store_true')
     for command in ('export', 'report'):
         out = sub.add_parser(command); out.add_argument('file')
@@ -645,6 +689,14 @@ def main():
             if not 1 <= a.limit <= 100:
                 raise ValueError('limit must be 1..100')
             seo(db, json.loads(Path(a.config).read_text(encoding='utf-8')), a.limit)
+        elif a.command == 'shortlist':
+            for r in shortlist(db, a.weak_only):
+                c = r['row']
+                phones = [x[0] for x in db.execute("SELECT value FROM contacts WHERE company_id=? AND kind='phone'", (c['id'],))]
+                print('%s | %s | сайт: %s | %s | %s' % (c['name'][:45], (c['city'] or '?').strip(), SITE_LABELS.get(c['site_kind'] or 'own', ''), r['kind'] or 'не ясно', ', '.join(phones)))
+                for label, items in (('прозрачное', r['clear']), ('плёнка', r['film'])):
+                    name, price, link = items[0]
+                    print('    %s (%d): %s | %s грн | %s' % (label, len(items), name[:80], price or '?', link))
         elif a.command == 'offers':
             for o in find_offers(db, a.words, a.roll):
                 print('%s | %s | %s | %s грн | %s' % (o['company'][:40], o['city'] or '?', o['name'][:90], o['price'] or '?', o['url'] or o['prom_url']))

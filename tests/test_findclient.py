@@ -271,5 +271,36 @@ class FindClientTests(unittest.TestCase):
         db.execute('SELECT visibility,indexed FROM audits')
         db.close()
 
+    def test_seller_kind(self):
+        self.assertEqual(f.seller_kind('Мы производим тенты на заказ'), 'производитель?')
+        self.assertEqual(f.seller_kind('Официальный дилер, склад-магазин'), 'дилер/склад')
+        self.assertEqual(f.seller_kind('Наш склад. Собственное производство и дилер Fortex'), 'и то и то')
+        self.assertEqual(f.seller_kind(None), '')
+
+    def test_shortlist_needs_both_clear_and_film(self):
+        other = f.add(self.db, 'https://other.ua', 'Other', 'test', 'manual')
+        self.db.execute("UPDATE companies SET about='Мы производим плёнку'")
+        rows = [(self.ident, 'Мягкое стекло 0,8 мм на метраж'), (self.ident, 'Плёнка армированная Fortex 6 х 25 м'),
+                (other, 'Пленка ПВХ прозрачная 0.5 мм'), (other, 'Скотч армированный 50 мм')]
+        for ident, name in rows:
+            self.db.execute('INSERT INTO listings(company_id,name,price) VALUES(?,?,?)', (ident, name, '1'))
+        result = f.shortlist(self.db)
+        self.assertEqual([r['row']['id'] for r in result], [self.ident])  # other has no plain film
+        self.assertEqual(result[0]['kind'], 'производитель?')
+        self.assertFalse(f.is_film('Самоклеящаяся пленка'))
+        self.assertTrue(f.is_clear('Пленка ПВХ Crystal прозрачная'))
+
+    def test_prom_reingest_keeps_prom_platform_kind(self):
+        raw = self.prom_page('https://www.example.com/')
+        f.ingest_prom(self.db, raw, 'https://prom.ua/c777-test.html', 'prom', 'prom: cat')
+        self.db.execute("UPDATE companies SET site_kind='prom_platform'")
+        f.ingest_prom(self.db, raw, 'https://prom.ua/c777-test.html', 'prom', 'prom: cat')
+        self.assertEqual(self.company()['site_kind'], 'prom_platform')
+
+    def test_prom_profile_stores_about(self):
+        raw = self.prom_page('https://www.example.com/').replace('"name": "Тент Тест"', '"name": "Тент Тест", "description": "Мы производим тенты"')
+        f.ingest_prom(self.db, raw, 'https://prom.ua/c777-test.html', 'prom', 'prom: cat')
+        self.assertEqual(self.company()['about'], 'Мы производим тенты')
+
 if __name__ == '__main__':
     unittest.main()
