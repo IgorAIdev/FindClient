@@ -202,5 +202,67 @@ class FindClientTests(unittest.TestCase):
         self.assertIsNone(db.execute('SELECT site_kind FROM companies').fetchone()[0])
         db.close()
 
+    def test_position_and_visibility(self):
+        urls = ['https://a.ua/', 'https://www.example.com/x', 'https://shop.example.com/']
+        self.assertEqual(f.position(urls, 'example.com'), 2)
+        self.assertIsNone(f.position(urls, 'other.ua'))
+        self.assertEqual([f.visibility_points(p) for p in (None, 1, 3, 4, 10, 11, 20)], [0, 1, 1, 0.6, 0.6, 0.3, 0.3])
+
+    @patch('findclient.time.sleep')
+    @patch('findclient.brave_results')
+    def test_seo_visibility(self, brave, sleep):
+        self.db.execute("UPDATE companies SET city='Киев'")
+        answers = {'тент': ['https://example.com/'], 'тент Киев': ['https://x.ua/'] * 4 + ['https://example.com/a'],
+                   'site:example.com': ['https://example.com/'] * 3}
+        brave.side_effect = lambda key, query, **kw: [{'url': u} for u in answers[query]]
+        with patch.dict('os.environ', {'BRAVE_SEARCH_API_KEY': 'k'}):
+            f.seo(self.db, {'seo_queries': ['тент']})
+        row = self.db.execute('SELECT * FROM audits').fetchone()
+        self.assertEqual((row['visibility'], row['indexed']), (80, '1-19'))  # (1 + 0.6) / 2
+        self.assertEqual(self.db.execute('SELECT position FROM rankings WHERE query=?', ('тент Киев',)).fetchone()[0], 5)
+        self.assertEqual(brave.call_args.kwargs, {'country': 'UA'})
+
+    def test_seo_needs_key_and_queries(self):
+        with patch.dict('os.environ', {}, clear=True):
+            with self.assertRaises(ValueError):
+                f.seo(self.db, {'seo_queries': ['x']})
+        with patch.dict('os.environ', {'BRAVE_SEARCH_API_KEY': 'k'}):
+            with self.assertRaises(ValueError):
+                f.seo(self.db, {})
+
+    @patch('findclient.time.sleep')
+    @patch('findclient.fetch')
+    def test_audit_keeps_search_visibility(self, fetch, sleep):
+        self.db.execute('INSERT INTO audits(company_id,visibility,indexed) VALUES(?,?,?)', (self.ident, 55, '20+'))
+        pages = {'https://example.com/robots.txt': '', 'https://example.com/': self.GOOD, 'https://example.com/sitemap.xml': ''}
+        fetch.side_effect = lambda url: pages[url]
+        f.audit(self.db, self.company())
+        row = self.db.execute('SELECT * FROM audits').fetchone()
+        self.assertEqual((row['visibility'], row['indexed']), (55, '20+'))
+        self.assertIsNotNone(row['score'])
+
+    def test_keyword_ideas_from_listings(self):
+        other = f.add(self.db, 'https://other.ua', 'Other', 'test', 'manual')
+        for ident, name in ((self.ident, 'Тент ПВХ 650 для прицепа'), (other, 'Тент ПВХ на Газель &amp;quot;Plandeka&amp;quot;'), (other, 'Мягкое стекло')):
+            self.db.execute('INSERT INTO listings VALUES(?,?)', (ident, name))
+        ideas = dict(f.keyword_ideas(self.db))
+        self.assertEqual(ideas['тент пвх'], 2)
+        self.assertNotIn('мягкое стекло', ideas)  # one seller only
+        self.assertFalse({'quot', 'plandeka', 'amp'} & set(ideas))
+
+    def test_prom_profile_stores_listing_names(self):
+        raw = self.prom_page('https://www.example.com/') + '<script type="application/ld+json">{"@type":"Product","name":"Тент ПВХ"}</script>'
+        f.ingest_prom(self.db, raw, 'https://prom.ua/c777-test.html', 'prom', 'prom: cat')
+        self.assertEqual([r[0] for r in self.db.execute('SELECT name FROM listings')], ['Тент ПВХ'])
+
+    def test_old_audits_table_is_migrated(self):
+        path = Path(self.tmp.name) / 'old2.db'
+        old = sqlite3.connect(path)
+        old.execute('CREATE TABLE audits (company_id INTEGER PRIMARY KEY, checked_at TEXT, score INTEGER, offer TEXT, summary TEXT, details TEXT, error TEXT)')
+        old.commit(); old.close()
+        db = f.connect(str(path))
+        db.execute('SELECT visibility,indexed FROM audits')
+        db.close()
+
 if __name__ == '__main__':
     unittest.main()

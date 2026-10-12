@@ -137,6 +137,11 @@ def connect(path):
     CREATE TABLE IF NOT EXISTS discoveries (
       company_id INTEGER REFERENCES companies(id), source TEXT,
       found_at TEXT, UNIQUE(company_id,source));
+    CREATE TABLE IF NOT EXISTS rankings (
+      company_id INTEGER REFERENCES companies(id), query TEXT, position INTEGER,
+      checked_at TEXT, PRIMARY KEY(company_id,query));
+    CREATE TABLE IF NOT EXISTS listings (
+      company_id INTEGER REFERENCES companies(id), name TEXT, UNIQUE(company_id,name));
     CREATE TABLE IF NOT EXISTS audits (
       company_id INTEGER PRIMARY KEY REFERENCES companies(id), checked_at TEXT,
       score INTEGER, offer TEXT, summary TEXT, details TEXT, error TEXT);
@@ -145,6 +150,10 @@ def connect(path):
     for column in ('city', 'site_kind', 'prom_url'):
         if column not in have:
             db.execute('ALTER TABLE companies ADD COLUMN ' + column + ' TEXT')
+    have = {row[1] for row in db.execute('PRAGMA table_info(audits)')}
+    for column, kind in (('visibility', 'INTEGER'), ('indexed', 'TEXT')):
+        if column not in have:
+            db.execute('ALTER TABLE audits ADD COLUMN ' + column + ' ' + kind)
     return db
 
 def add(db, url, name, campaign, source, key=None):
@@ -266,6 +275,14 @@ def prom_company(raw, url):
             pass
     if not info['name']:
         raise ValueError('Not a prom.ua company profile: ' + url)
+    info['products'] = []
+    for block in re.findall(r'<script type="application/ld\+json">(.*?)</script>', raw, re.S):
+        try:
+            data = json.loads(block)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get('@type') == 'Product' and data.get('name'):
+            info['products'].append(str(data['name'])[:200])
     return info
 
 def ingest_prom(db, raw, url, campaign, source):
@@ -284,6 +301,8 @@ def ingest_prom(db, raw, url, campaign, source):
         contacts.append(('email', info['email'].strip().lower()))
     if kind == 'social':
         contacts.append(('messenger', info['site']))
+    for name in info['products']:
+        db.execute('INSERT OR IGNORE INTO listings VALUES(?,?)', (ident, name))
     for k, value in contacts:
         db.execute('''INSERT INTO contacts VALUES(?,?,?,?,?)
           ON CONFLICT(company_id,kind,value,source) DO UPDATE SET checked_at=excluded.checked_at''',
@@ -456,26 +475,89 @@ def audit(db, company, delay=2):
         except (OSError, ValueError) as e:
             error = type(e).__name__ + ': ' + str(e)[:150]
             offer, summary = 'unreachable', 'Сайт не открылся автоматически (' + error + '): проверить вручную.'
-    db.execute('INSERT OR REPLACE INTO audits VALUES(?,?,?,?,?,?,?)',
+    db.execute('''INSERT INTO audits(company_id,checked_at,score,offer,summary,details,error) VALUES(?,?,?,?,?,?,?)
+      ON CONFLICT(company_id) DO UPDATE SET checked_at=excluded.checked_at,score=excluded.score,
+      offer=excluded.offer,summary=excluded.summary,details=excluded.details,error=excluded.error''',
                (company['id'], now(), score, offer, summary, details, error))
     db.commit()
     return offer, score
+
+def brave_results(key, query, **extra):
+    params = urlencode({'q': query, 'count': 20, **extra})
+    result = json.loads(fetch('https://api.search.brave.com/res/v1/web/search?' + params,
+                              {'X-Subscription-Token': key}))
+    return result.get('web', {}).get('results', [])
 
 def search(db, config):
     key = os.environ.get('BRAVE_SEARCH_API_KEY')
     if not key:
         raise ValueError('Set BRAVE_SEARCH_API_KEY, or use import with a URL list')
     for query in config['queries']:
-        params = urlencode({'q': query, 'count': 20})
-        result = json.loads(fetch('https://api.search.brave.com/res/v1/web/search?' + params,
-                                 {'X-Subscription-Token': key}))
-        for item in result.get('web', {}).get('results', []):
+        for item in brave_results(key, query):
             add(db, item['url'], item.get('title', ''), config['name'], 'search: ' + query)
         time.sleep(1)
 
+STOPWORDS = {'для', 'під', 'при', 'від', 'або', 'the', 'and', 'под', 'при', 'про', 'без', 'над', 'гр', 'мм', 'см', 'шт'}
+
+def keyword_ideas(db, top=30):
+    """Phrases that several sellers use in their own listings (wording, not search volume)."""
+    seen = {}
+    for row in db.execute('SELECT company_id,name FROM listings'):
+        name = html.unescape(html.unescape(row['name'])).lower()  # prom.ua double-escapes quotes
+        words = [w for w in re.findall(r'[а-яіїєґё]{3,}', name) if w not in STOPWORDS]
+        phrases = set(words) | {a + ' ' + b for a, b in zip(words, words[1:])}
+        for phrase in phrases:
+            seen.setdefault(phrase, set()).add(row['company_id'])
+    ranked = sorted(((len(c), p) for p, c in seen.items() if len(c) >= 2),
+                    key=lambda x: (-x[0], -x[1].count(' '), x[1]))
+    return [(p, n) for n, p in ranked[:top]]
+
+def position(urls, host):
+    for number, url in enumerate(urls, 1):
+        found = domain(url)
+        if found == host or found.endswith('.' + host):
+            return number
+    return None
+
+def visibility_points(place):
+    return 0 if place is None else 1 if place <= 3 else 0.6 if place <= 10 else 0.3
+
+def seo(db, config, limit=20, delay=1):
+    """Where does each company's own domain rank in Brave results for the campaign's niche queries?"""
+    key = os.environ.get('BRAVE_SEARCH_API_KEY')
+    if not key:
+        raise ValueError('Set BRAVE_SEARCH_API_KEY to check search visibility')
+    base = [q.strip() for q in config.get('seo_queries', []) if q.strip()]
+    if not base:
+        raise ValueError('Add "seo_queries" to the campaign config')
+    cache = {}
+    def top(query):
+        if query not in cache:
+            cache[query] = [item['url'] for item in brave_results(key, query, country='UA')]
+            time.sleep(delay)
+        return cache[query]
+    rows = db.execute("""SELECT c.* FROM companies c LEFT JOIN audits a ON a.company_id=c.id
+        WHERE c.status!='do_not_contact' AND c.domain NOT LIKE 'prom.ua/%'
+          AND COALESCE(c.site_kind,'own') IN ('own','prom_platform')
+        ORDER BY a.visibility IS NOT NULL,c.id LIMIT ?""", (limit,)).fetchall()
+    for company in rows:
+        queries = base + ([q + ' ' + company['city'] for q in base] if company['city'] else [])
+        total = 0
+        for query in queries:
+            place = position(top(query), company['domain'])
+            total += visibility_points(place)
+            db.execute('INSERT OR REPLACE INTO rankings VALUES(?,?,?,?)', (company['id'], query, place, now()))
+        count = len(top('site:' + company['domain']))
+        indexed = '0' if not count else '20+' if count >= 20 else '1-19'
+        score = round(100 * total / len(queries))
+        db.execute('INSERT OR IGNORE INTO audits(company_id) VALUES(?)', (company['id'],))
+        db.execute('UPDATE audits SET visibility=?,indexed=? WHERE company_id=?', (score, indexed, company['id']))
+        db.commit()
+        print('Visibility:', company['domain'], score, 'indexed', indexed, flush=True)
+
 def export(db, destination):
     rows = db.execute('''SELECT c.id,c.name,c.domain,c.url,c.city,c.site_kind,c.prom_url,c.campaign,c.role,c.status,c.notes,
-       a.score AS site_score,a.offer,a.summary,
+       a.score AS site_score,a.visibility AS search_visibility,a.indexed AS indexed_results,a.offer,a.summary,
        t.kind,t.value,t.source,t.checked_at,c.error FROM companies c
        LEFT JOIN audits a ON a.company_id=c.id
        LEFT JOIN contacts t ON t.company_id=c.id ORDER BY c.id,t.kind,t.value''')
@@ -491,7 +573,7 @@ def report(db, destination):
         contacts = db.execute('SELECT DISTINCT kind,value,source FROM contacts WHERE company_id=?', (c['id'],))
         details = ''.join('<li>' + html.escape(t['kind'] + ': ' + t['value']) + ' — <a href="' + html.escape(t['source'], quote=True) + '">источник</a></li>' for t in contacts)
         a = db.execute('SELECT * FROM audits WHERE company_id=?', (c['id'],)).fetchone()
-        verdict = '<p><b>' + html.escape(SITE_LABELS.get(c['site_kind'] or 'own', '') + (' · ' + c['city'] if c['city'] else '')) + '</b>' + ('<br>' + html.escape(a['summary']) if a else '') + '</p>'
+        verdict = '<p><b>' + html.escape(SITE_LABELS.get(c['site_kind'] or 'own', '') + (' · ' + c['city'] if c['city'] else '')) + '</b>' + ('<br>' + html.escape(a['summary']) if a else '') + ('<br>Видимость в поиске: ' + str(a['visibility']) + '/100, результатов site: ' + html.escape(a['indexed'] or '') if a and a['visibility'] is not None else '') + '</p>'
         cards.append('<article><h2>' + html.escape(c['name']) + '</h2><p>' + html.escape(c['status'] + ' · ' + c['role']) + '</p>' + verdict + '<a href="' + html.escape(c['url'], quote=True) + '">' + html.escape(c['domain']) + '</a><ul>' + details + '</ul><p>' + html.escape(c['notes']) + '</p><small>' + html.escape(c['error'] or '') + '</small></article>')
     Path(destination).write_text('<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FindClient</title><style>body{font:16px system-ui;background:#f2f5f8;max-width:1000px;margin:30px auto;padding:16px}article{background:white;padding:20px;margin:16px 0;border-radius:14px}a{color:#1764ad}li{overflow-wrap:anywhere;margin:8px 0}small{color:#9b3535}</style><h1>FindClient · Компании и контакты</h1><p>Публичные контакты. Роль компании и актуальность требуют проверки.</p>' + ''.join(cards) + '</html>', encoding='utf-8')
 
@@ -504,6 +586,8 @@ def main():
     c = sub.add_parser('crawl'); c.add_argument('--limit', type=int, default=20); c.add_argument('--pages', type=int, default=4)
     pr = sub.add_parser('prom'); pr.add_argument('urls', nargs='*'); pr.add_argument('--config'); pr.add_argument('--campaign', default='films-ua'); pr.add_argument('--limit', type=int, default=30)
     au = sub.add_parser('audit'); au.add_argument('--limit', type=int, default=20)
+    se = sub.add_parser('seo'); se.add_argument('config'); se.add_argument('--limit', type=int, default=20)
+    kw = sub.add_parser('keywords'); kw.add_argument('--top', type=int, default=30)
     for command in ('export', 'report'):
         out = sub.add_parser(command); out.add_argument('file')
     u = sub.add_parser('update'); u.add_argument('id', type=int); u.add_argument('--status', choices=STATUSES); u.add_argument('--notes'); u.add_argument('--role', choices=('manufacturer','seller','installer','directory','unverified'))
@@ -537,6 +621,13 @@ def main():
             for company in rows:
                 offer, score = audit(db, company)
                 print('Audit:', company['domain'], '->', offer, score if score is not None else '', flush=True)
+        elif a.command == 'seo':
+            if not 1 <= a.limit <= 100:
+                raise ValueError('limit must be 1..100')
+            seo(db, json.loads(Path(a.config).read_text(encoding='utf-8')), a.limit)
+        elif a.command == 'keywords':
+            for phrase, count in keyword_ideas(db, a.top):
+                print(count, phrase)
         elif a.command == 'export':
             export(db, a.file)
         elif a.command == 'report':
