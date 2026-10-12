@@ -281,7 +281,7 @@ class FindClientTests(unittest.TestCase):
         other = f.add(self.db, 'https://other.ua', 'Other', 'test', 'manual')
         self.db.execute("UPDATE companies SET about='Мы производим плёнку'")
         rows = [(self.ident, 'Мягкое стекло 0,8 мм на метраж'), (self.ident, 'Плёнка армированная Fortex 6 х 25 м'),
-                (other, 'Пленка ПВХ прозрачная 0.5 мм'), (other, 'Скотч армированный 50 мм')]
+                (other, 'Пленка ПВХ прозрачная 0.5 мм'), (other, 'Скотч армированный 50 мм'), (other, 'Пленка мульчирующая черная')]
         for ident, name in rows:
             self.db.execute('INSERT INTO listings(company_id,name,price) VALUES(?,?,?)', (ident, name, '1'))
         result = f.shortlist(self.db)
@@ -289,6 +289,10 @@ class FindClientTests(unittest.TestCase):
         self.assertEqual(result[0]['kind'], 'производитель?')
         self.assertEqual(result[0]['row']['name'], 'Example')  # company name, not a listing name
         self.assertFalse(f.is_film('Самоклеящаяся пленка'))
+        self.assertFalse(f.is_film('Пленка черная мульчирующая'))
+        self.assertTrue(f.is_film('Пленка тепличная UV 150 мкм 6х50'))
+        self.assertTrue(f.is_clear('Мягкое окно для беседки'))
+        self.assertFalse(f.is_clear('Коврик мягкое стекло'))
         self.assertTrue(f.is_clear('Пленка ПВХ Crystal прозрачная'))
 
     def test_prom_reingest_keeps_prom_platform_kind(self):

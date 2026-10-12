@@ -544,15 +544,21 @@ def seller_kind(about):
     return 'производитель?' if maker and not dealer else 'дилер/склад' if dealer and not maker else 'и то и то' if maker else ''
 
 def is_clear(name):
+    """Soft glass or clear PVC film (the window material)."""
     n = name.lower().replace('ё', 'е')
-    return ('стекл' in n and ('мягк' in n or "м'як" in n or 'мяк' in n)) or ('прозр' in n and 'пвх' in n and 'пленк' in n)
+    if re.search(r'коврик|дорожк|тюбинг|сетк|скатерт', n):
+        return False
+    return ('стекл' in n and ('мягк' in n or "м'як" in n or 'мяк' in n)) or ('прозр' in n and 'пвх' in n and 'пленк' in n) or \
+           ('мягк' in n and 'окн' in n)
 
 def is_film(name):
+    """Armored / greenhouse / UV / polyethylene film for the body of a shelter (not clear PVC, not tape or decor)."""
     n = name.lower().replace('ё', 'е')
-    return ('пленк' in n or 'плівк' in n) and not re.search(r'самокле|декор|скотч|лента|мебел|стекл|окн', n)
+    return ('пленк' in n or 'плівк' in n) and bool(re.search(r'армир|армован|теплич|uv|укрыв|полиэтилен|поліетилен', n)) and \
+        not re.search(r'dtf|мульч|самокле|декор|скотч|лента|фольг|шланг|мебел|окн|теплиц[аы]\b|для печати', n)
 
 def shortlist(db, weak_only=False):
-    """Sellers that list both clear PVC / soft glass and plain film, weak-site and self-declared makers first."""
+    """Strict: sellers that list BOTH clear PVC/soft glass AND body film. Site and self-description are only shown."""
     sellers = {}
     for row in db.execute("""SELECT l.name AS item,l.price AS item_price,l.url AS item_url,c.* FROM listings l
                              JOIN companies c ON c.id=l.company_id"""):
@@ -560,7 +566,7 @@ def shortlist(db, weak_only=False):
         entry = sellers.setdefault(row['id'], {'row': dict(row), 'clear': [], 'film': []})
         if is_clear(name):
             entry['clear'].append((name, row['item_price'], row['item_url']))
-        if is_film(name) and not is_clear(name):
+        elif is_film(name):
             entry['film'].append((name, row['item_price'], row['item_url']))
     result = []
     for entry in sellers.values():
@@ -570,10 +576,8 @@ def shortlist(db, weak_only=False):
         weak = (row['site_kind'] or 'own') in WEAK_SITES + ('prom_platform',)
         if weak_only and not weak:
             continue
-        kind = seller_kind(row['about'])
-        result.append({**entry, 'weak': weak, 'kind': kind,
-                       'rank': (not weak, kind not in ('производитель?', 'и то и то'), -len(entry['clear']) - len(entry['film']))})
-    return [{k: v for k, v in r.items() if k != 'rank'} for r in sorted(result, key=lambda r: r['rank'])]
+        result.append({**entry, 'weak': weak, 'kind': seller_kind(row['about'])})
+    return sorted(result, key=lambda r: (-min(len(r['clear']), len(r['film'])), -len(r['clear']) - len(r['film'])))
 
 def position(urls, host):
     for number, url in enumerate(urls, 1):
