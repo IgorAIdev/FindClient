@@ -554,13 +554,14 @@ def is_film(name):
 def shortlist(db, weak_only=False):
     """Sellers that list both clear PVC / soft glass and plain film, weak-site and self-declared makers first."""
     sellers = {}
-    for row in db.execute("""SELECT l.name,l.price,l.url,c.* FROM listings l JOIN companies c ON c.id=l.company_id"""):
-        name = html.unescape(html.unescape(row['name']))
+    for row in db.execute("""SELECT l.name AS item,l.price AS item_price,l.url AS item_url,c.* FROM listings l
+                             JOIN companies c ON c.id=l.company_id"""):
+        name = html.unescape(html.unescape(row['item']))
         entry = sellers.setdefault(row['id'], {'row': dict(row), 'clear': [], 'film': []})
         if is_clear(name):
-            entry['clear'].append((name, row['price'], row['url']))
+            entry['clear'].append((name, row['item_price'], row['item_url']))
         if is_film(name) and not is_clear(name):
-            entry['film'].append((name, row['price'], row['url']))
+            entry['film'].append((name, row['item_price'], row['item_url']))
     result = []
     for entry in sellers.values():
         if not (entry['clear'] and entry['film']):

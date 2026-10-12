@@ -287,6 +287,7 @@ class FindClientTests(unittest.TestCase):
         result = f.shortlist(self.db)
         self.assertEqual([r['row']['id'] for r in result], [self.ident])  # other has no plain film
         self.assertEqual(result[0]['kind'], 'производитель?')
+        self.assertEqual(result[0]['row']['name'], 'Example')  # company name, not a listing name
         self.assertFalse(f.is_film('Самоклеящаяся пленка'))
         self.assertTrue(f.is_clear('Пленка ПВХ Crystal прозрачная'))
 
