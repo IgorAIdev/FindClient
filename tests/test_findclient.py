@@ -158,6 +158,15 @@ class FindClientTests(unittest.TestCase):
         self.assertEqual(json.loads(row['details'])['sitemap_pages'], 30)
 
     @patch('findclient.time.sleep')
+    @patch('findclient.fetch')
+    def test_audit_detects_prom_platform_site(self, fetch, sleep):
+        home = self.GOOD.replace('</head>', '<script src="/cloud-cgi/static/uaprom-static/js/adv_teasers.js"></script></head>')
+        pages = {'https://example.com/robots.txt': '', 'https://example.com/': home, 'https://example.com/sitemap.xml': ''}
+        fetch.side_effect = lambda url: pages[url]
+        self.assertEqual(f.audit(self.db, self.company())[0], 'prom_site')
+        self.assertEqual(self.company()['site_kind'], 'prom_platform')
+
+    @patch('findclient.time.sleep')
     @patch('findclient.fetch', side_effect=OSError('boom'))
     def test_audit_unreachable(self, fetch, sleep):
         self.assertEqual(f.audit(self.db, self.company()), ('unreachable', None))

@@ -204,7 +204,8 @@ SOCIAL_HOSTS = ('facebook.com', 'instagram.com', 't.me', 'olx.ua', 'tiktok.com',
 FREE_HOSTS = ('prom.ua', 'business.site', 'wixsite.com', 'tilda.ws', 'blogspot.com', 'jimdosite.com',
               'webnode.page', 'weebly.com', 'github.io', 'carrd.co')
 WEAK_SITES = ('none', 'prom_hosted', 'social', 'free_host')
-SITE_LABELS = {'own': 'свой сайт', 'none': 'сайта нет', 'prom_hosted': 'только магазин на prom.ua',
+PROM_PLATFORM_RE = re.compile(r'(?:src|href)=["\'][^"\']*/cloud-cgi/static/(?:uaprom|vader)-static/', re.I)
+SITE_LABELS = {'own': 'свой сайт', 'prom_platform': 'сайт на конструкторе prom.ua (свой домен)', 'none': 'сайта нет', 'prom_hosted': 'только магазин на prom.ua',
                'social': 'только соцсеть/площадка', 'free_host': 'бесплатный конструктор'}
 
 def host_in(host, names):
@@ -396,6 +397,9 @@ def recommend(kind, result=None):
     if kind in WEAK_SITES:
         return 'site', 'Нет собственного сайта (' + SITE_LABELS[kind] + '): предложить сайт-визитку/каталог.'
     score, top = result['score'], '; '.join(result['issues'][:3])
+    if kind == 'prom_platform':
+        return 'prom_site', ('Сайт на конструкторе prom.ua (%d/100): шаблонный и привязан к подписке. '
+                             'Предложить отдельный сайт или SEO-статьи/блог. Главное: %s.' % (score, top))
     if score < 45:
         return 'redesign', 'Сайт слабый (%d/100): предложить переделку/адаптацию. Главное: %s.' % (score, top)
     thin = result['sitemap_pages'] is not None and result['sitemap_pages'] < 15
@@ -444,6 +448,9 @@ def audit(db, company, delay=2):
                 except (OSError, ValueError):
                     pass
             result = score_site(raw, root + '/', elapsed, sitemap)
+            if PROM_PLATFORM_RE.search(raw):
+                kind = 'prom_platform'
+            db.execute('UPDATE companies SET site_kind=? WHERE id=?', (kind, company['id']))
             offer, summary = recommend(kind, result)
             score, details = result['score'], json.dumps(result, ensure_ascii=False)
         except (OSError, ValueError) as e:
