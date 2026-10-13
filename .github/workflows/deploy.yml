@@ -1,0 +1,61 @@
+name: Deploy to VPS
+
+# Runs the tests on every push and pull request. On a push to main it also updates the server
+# over SSH, but only if the repository secrets below are set. Nothing else touches the server.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m unittest discover -s tests -v
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_PORT: ${{ secrets.VPS_PORT }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+      VPS_APP_DIR: ${{ vars.VPS_APP_DIR }}
+      VPS_INSTALL_CRON: ${{ vars.VPS_INSTALL_CRON }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update the server
+        run: |
+          if [ -z "$VPS_HOST" ] || [ -z "$VPS_USER" ] || [ -z "$VPS_SSH_KEY" ] || [ -z "$VPS_KNOWN_HOSTS" ]; then
+            echo "VPS secrets are not set; skipping deploy."
+            exit 0
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          remote_env="BRANCH=main INSTALL_CRON=${VPS_INSTALL_CRON:-0}"
+          if [ -n "$VPS_APP_DIR" ]; then
+            case "$VPS_APP_DIR" in
+              /*[!A-Za-z0-9_./-]* | [!/]*) echo "VPS_APP_DIR must be an absolute path without spaces or quotes"; exit 1 ;;
+            esac
+            remote_env="$remote_env APP_DIR=$VPS_APP_DIR"
+          fi
+          case "${VPS_INSTALL_CRON:-0}" in 0|1) ;; *) echo "VPS_INSTALL_CRON must be 0 or 1"; exit 1 ;; esac
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -p "${VPS_PORT:-22}" "$VPS_USER@$VPS_HOST" "$remote_env bash -s" < deploy/install.sh
