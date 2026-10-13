@@ -36,7 +36,7 @@ class FindClientTests(unittest.TestCase):
     @patch('findclient.time.sleep')
     @patch('findclient.fetch')
     def test_crawl_and_dedup(self, fetch, sleep):
-        fetch.side_effect = lambda url: 'User-agent: *\nAllow: /' if url.endswith('/robots.txt') else '<a href="mailto:hi@example.com">Email</a>'
+        fetch.side_effect = lambda url, headers=None: 'User-agent: *\nAllow: /' if url.endswith('/robots.txt') else '<a href="mailto:hi@example.com">Email</a>'
         f.crawl(self.db,self.company())
         f.crawl(self.db,self.company())
         self.assertEqual(self.db.execute('SELECT count(*) FROM contacts').fetchone()[0],1)
@@ -155,7 +155,7 @@ class FindClientTests(unittest.TestCase):
         pages = {'https://example.com/robots.txt': 'User-agent: *\nAllow: /',
                  'https://example.com/': self.GOOD,
                  'https://example.com/sitemap.xml': '<urlset>' + '<loc>x</loc>' * 30 + '</urlset>'}
-        fetch.side_effect = lambda url: pages[url]
+        fetch.side_effect = lambda url, headers=None: pages[url]
         offer, score = f.audit(self.db, self.company())
         self.assertEqual(offer, 'none')
         self.assertGreaterEqual(score, 90)
@@ -167,7 +167,7 @@ class FindClientTests(unittest.TestCase):
     def test_audit_detects_prom_platform_site(self, fetch, sleep):
         home = self.GOOD.replace('</head>', '<script src="/cloud-cgi/static/uaprom-static/js/adv_teasers.js"></script></head>')
         pages = {'https://example.com/robots.txt': '', 'https://example.com/': home, 'https://example.com/sitemap.xml': ''}
-        fetch.side_effect = lambda url: pages[url]
+        fetch.side_effect = lambda url, headers=None: pages[url]
         self.assertEqual(f.audit(self.db, self.company())[0], 'prom_site')
         self.assertEqual(self.company()['site_kind'], 'prom_platform')
 
@@ -235,7 +235,7 @@ class FindClientTests(unittest.TestCase):
     def test_audit_keeps_search_visibility(self, fetch, sleep):
         self.db.execute('INSERT INTO audits(company_id,visibility,indexed) VALUES(?,?,?)', (self.ident, 55, '20+'))
         pages = {'https://example.com/robots.txt': '', 'https://example.com/': self.GOOD, 'https://example.com/sitemap.xml': ''}
-        fetch.side_effect = lambda url: pages[url]
+        fetch.side_effect = lambda url, headers=None: pages[url]
         f.audit(self.db, self.company())
         row = self.db.execute('SELECT * FROM audits').fetchone()
         self.assertEqual((row['visibility'], row['indexed']), (55, '20+'))
@@ -307,6 +307,42 @@ class FindClientTests(unittest.TestCase):
         raw = self.prom_page('https://www.example.com/').replace('"name": "Тент Тест"', '"name": "Тент Тест", "description": "Мы производим тенты"')
         f.ingest_prom(self.db, raw, 'https://prom.ua/c777-test.html', 'prom', 'prom: cat')
         self.assertEqual(self.company()['about'], 'Мы производим тенты')
+
+    DESKTOP_ONLY = '<html><head><title>Тенты</title><link rel="stylesheet" href="/css/desktop.css"><script src="/js/d.js"></script></head><body>' + 'текст ' * 400 + '</body></html>'
+    PHONE = '<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Тенты</title><link rel="stylesheet" href="/css/mobile.css"><script src="/js/m.js"></script></head><body>' + 'текст ' * 100 + '</body></html>'
+
+    def test_compare_mobile(self):
+        self.assertTrue(f.compare_mobile(self.DESKTOP_ONLY, self.PHONE)['separate'])
+        same = f.compare_mobile(self.PHONE, self.PHONE)
+        self.assertFalse(same['separate'])
+        self.assertTrue(same['viewport'])
+
+    def test_identical_pages_with_changing_asset_urls_are_not_separate(self):
+        a = '<link rel="stylesheet" href="/a.css?v=1"><script src="/app.js?t=111"></script>' + 'x' * 500
+        b = '<link rel="stylesheet" href="/a.css?v=2"><script src="/app.js?t=222"></script>' + 'x' * 500
+        self.assertFalse(f.compare_mobile(a, b)['separate'])
+
+    def test_viewport_is_judged_on_the_phone_response(self):
+        with_vp = f.score_site(self.DESKTOP_ONLY, 'https://e.com/', mobile_raw=self.PHONE)
+        without = f.score_site(self.PHONE, 'https://e.com/', mobile_raw=self.DESKTOP_ONLY)
+        got = lambda r: [c['got'] for c in r['checks'] if c['code'] == 'viewport'][0]
+        self.assertEqual((got(with_vp), got(without)), (10, 0))
+        self.assertIn('отдельная', f.recommend('own', with_vp)[1])
+
+    @patch('findclient.time.sleep')
+    @patch('findclient.fetch')
+    def test_audit_requests_the_page_as_a_phone(self, fetch, sleep):
+        calls = []
+        def answer(url, headers=None):
+            calls.append((url, (headers or {}).get('User-Agent', '')))
+            if url.endswith('robots.txt') or url.endswith('sitemap.xml'):
+                return ''
+            return self.PHONE if headers and 'Mobile' in headers.get('User-Agent', '') else self.DESKTOP_ONLY
+        fetch.side_effect = answer
+        f.audit(self.db, self.company())
+        self.assertTrue(any('Mobile' in ua and 'FindClient' in ua for _, ua in calls))
+        import json as j
+        self.assertTrue(j.loads(self.db.execute('SELECT details FROM audits').fetchone()[0])['mobile']['separate'])
 
 if __name__ == '__main__':
     unittest.main()

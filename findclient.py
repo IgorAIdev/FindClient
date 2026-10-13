@@ -21,6 +21,8 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.robotparser import RobotFileParser
 
 AGENT = 'FindClient/0.1'
+MOBILE_AGENT = ('Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/120.0 Mobile Safari/537.36 ' + AGENT)
 STATUSES = ('new', 'called', 'written', 'replied', 'interested', 'closed', 'do_not_contact')
 
 def now():
@@ -382,10 +384,23 @@ class SiteParser(Page):
 
 BLOG_RE = re.compile(r'blog|news|article|stat[yi]|новин(?!к)|стат[іт]|блог|корисн|полезн|poleznoe|novosti', re.I)  # not "новинки" (new products)
 
-def score_site(raw, url, elapsed=0.0, sitemap_pages=None, year=None):
+def assets(raw):
+    return {u.split('?')[0] for u in re.findall(r'(?:src|href)=["\']([^"\']+\.(?:css|js)[^"\']*)', raw, re.I)}
+
+def compare_mobile(desktop, mobile):
+    """Does a phone get something different from a desktop browser? (UA-switched mobile site)"""
+    d, m = assets(desktop), assets(mobile)
+    overlap = len(d & m) / len(d | m) if d | m else 1
+    ratio = abs(len(mobile) - len(desktop)) / max(len(desktop), 1)
+    return {'separate': ratio > 0.15 or (overlap < 0.7 and ratio > 0.05), 'asset_overlap': round(overlap, 2),
+            'viewport': bool(re.search(r'<meta[^>]*name=["\']viewport["\'][^>]*width=device-width', mobile, re.I)),
+            'size_desktop': len(desktop), 'size_mobile': len(mobile)}
+
+def score_site(raw, url, elapsed=0.0, sitemap_pages=None, year=None, mobile_raw=None):
     """Heuristic 0-100 score from page HTML. Not a replacement for a real audit."""
     year = year or datetime.now(timezone.utc).year
     page = SiteParser(raw)
+    phone_page = SiteParser(mobile_raw) if mobile_raw else page   # what phones actually receive
     text = ' '.join(page.parts)
     words = len(re.findall(r'\w+', text))
     title = ' '.join(page.titles).strip()
@@ -396,7 +411,7 @@ def score_site(raw, url, elapsed=0.0, sitemap_pages=None, year=None):
     blog = any(BLOG_RE.search(href + ' ' + label) for href, label in page.anchors)
     checks = [
         ('https', 10, url.lower().startswith('https://'), 'Нет HTTPS'),
-        ('viewport', 10, 'viewport' in page.meta, 'Нет мобильной адаптации (meta viewport)'),
+        ('viewport', 10, 'viewport' in phone_page.meta, 'Нет мобильной адаптации (meta viewport)'),
         ('title', 7, 1 if 15 <= len(title) <= 70 else 0.5 if title else 0, 'Заголовок страницы (title) отсутствует или неудачной длины'),
         ('description', 7, 1 if 50 <= len(desc) <= 170 else 0.5 if desc else 0, 'Нет meta description или неудачной длины'),
         ('h1', 6, 1 if page.h1 == 1 else 0.5 if page.h1 > 1 else 0, 'Нет единственного заголовка H1'),
@@ -418,9 +433,18 @@ def score_site(raw, url, elapsed=0.0, sitemap_pages=None, year=None):
     score = round(sum(p[2] for p in points))
     issues = [m for _, w, got, m in sorted(points, key=lambda p: p[1] - p[2], reverse=True) if got < w]
     return {'score': score, 'issues': issues, 'words': words, 'blog': blog, 'sitemap_pages': sitemap_pages,
+            'mobile': compare_mobile(raw, mobile_raw) if mobile_raw else None,
             'checks': [{'code': c, 'max': w, 'got': round(g, 1)} for c, w, g, _ in points]}
 
+MOBILE_NOTE = ' Мобильная версия отдельная (по типу устройства): в режиме «версия для ПК» на телефоне открывается неудобная десктопная.'
+
 def recommend(kind, result=None):
+    offer, text = recommend_core(kind, result)
+    if result and (result.get('mobile') or {}).get('separate'):
+        text += MOBILE_NOTE
+    return offer, text
+
+def recommend_core(kind, result=None):
     """Return (offer, one-line suggestion in Russian)."""
     if kind in WEAK_SITES:
         return 'site', 'Нет собственного сайта (' + SITE_LABELS[kind] + '): предложить сайт-визитку/каталог.'
@@ -475,7 +499,14 @@ def audit(db, company, delay=2):
                         sitemap = max(sitemap or 0, 15)
                 except (OSError, ValueError):
                     pass
-            result = score_site(raw, root + '/', elapsed, sitemap)
+            mobile = None
+            if robot.can_fetch(MOBILE_AGENT, root + '/'):
+                time.sleep(delay)
+                try:
+                    mobile = fetch(root + '/', {'User-Agent': MOBILE_AGENT})
+                except (OSError, ValueError):
+                    pass
+            result = score_site(raw, root + '/', elapsed, sitemap, mobile_raw=mobile)
             if PROM_PLATFORM_RE.search(raw):
                 kind = 'prom_platform'
             db.execute('UPDATE companies SET site_kind=? WHERE id=?', (kind, company['id']))
